@@ -73,17 +73,27 @@ impl Auth {
     }
 }
 
+/// The client's access token. T3 Code 0.1.11 sends it as `DPoP <token>` on direct connections.
 pub fn bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+    let value = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("DPoP "))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_token_is_read_from_bearer_and_dpop_authorization() {
+        let token_in = |value: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::AUTHORIZATION, value.parse().unwrap());
+            bearer(&headers).map(str::to_owned)
+        };
+        assert_eq!(token_in("Bearer abc").as_deref(), Some("abc"));
+        assert_eq!(token_in("DPoP abc").as_deref(), Some("abc"));
+        assert_eq!(token_in("Basic abc"), None);
+    }
 
     #[test]
     fn a_ticket_opens_only_what_it_was_issued_for() {
