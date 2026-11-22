@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use crate::process::command;
 
+const TRIAL_MAX_TTL_SECS: &str = "7200";
+
 #[derive(Clone, Debug)]
 pub struct Boat {
     bin: PathBuf,
@@ -103,6 +105,15 @@ impl Boat {
         ))
     }
 
+    /// Free-trial accounts refuse `--no-auto-stop`; they get Boat's longest trial lifetime instead.
+    async fn output_without_auto_stop(&self, args: &[&str], timeout: Duration) -> Result<(bool, String, String)> {
+        let (ok, stdout, stderr) = self.output(&[args, &["--no-auto-stop"]].concat(), timeout).await?;
+        if ok || !said(&stdout, &stderr).contains("trial_auto_stop_required") {
+            return Ok((ok, stdout, stderr));
+        }
+        self.output(&[args, &["--ttl", TRIAL_MAX_TTL_SECS]].concat(), timeout).await
+    }
+
     async fn run(&self, args: &[&str], timeout: Duration) -> Result<String> {
         let (ok, stdout, stderr) = self.output(args, timeout).await?;
         if !ok {
@@ -129,10 +140,13 @@ impl Boat {
 
     /// Returns the new sandbox's id. `snapshot`: the saved snapshot its disk starts from.
     pub async fn create(&self, name: &str, size: &str, snapshot: Option<&str>) -> Result<String> {
-        let mut args = vec!["new", "--name", name, "--type", size, "--no-auto-stop"];
+        let mut args = vec!["new", "--name", name, "--type", size];
         args.extend(snapshot.into_iter().flat_map(|s| ["--from", s]));
-        let out = self.run(&args, Duration::from_secs(300)).await?;
-        let v = Self::last_json(&out)?;
+        let (ok, stdout, stderr) = self.output_without_auto_stop(&args, Duration::from_secs(300)).await?;
+        if !ok {
+            bail!("boat new failed: {}", said(&stdout, &stderr));
+        }
+        let v = Self::last_json(&stdout)?;
         let id = v["id"].as_str().ok_or_else(|| anyhow!("boat new returned no id"))?;
         Ok(id.to_owned())
     }
@@ -155,7 +169,7 @@ impl Boat {
     /// Resumes onto `size`, which is how a machine changes size.
     pub async fn resume(&self, id: &str, size: &str) -> Result<Resume> {
         let (ok, stdout, stderr) =
-            self.output(&["resume", id, "--no-auto-stop", "--type", size], Duration::from_secs(300)).await?;
+            self.output_without_auto_stop(&["resume", id, "--type", size], Duration::from_secs(300)).await?;
         let said = said(&stdout, &stderr);
         match ok {
             true => Ok(Resume::Resumed),
@@ -308,4 +322,70 @@ fn said<'a>(stdout: &'a str, stderr: &'a str) -> &'a str {
 /// Command-line form of a path; the Boat CLI and git only take UTF-8 here.
 pub(crate) fn path_str(path: &Path) -> Result<&str> {
     path.to_str().ok_or_else(|| anyhow!("path is not UTF-8: {}", path.display()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{Boat, Resume};
+    use std::os::unix::fs::PermissionsExt;
+
+    const TRIAL_BOAT: &str = r#"#!/bin/sh
+d=$(dirname "$0"); shift
+echo "$*" >> "$d/log"
+case " $* " in
+  *" --no-auto-stop "*) [ -f "$d/trial" ] || [ -f "$d/down" ] || { echo '{"id":"bx_new"}'; exit 0; }
+    [ -f "$d/down" ] && { echo 'Boat is down' >&2; exit 1; }
+    echo '{"code":"trial_auto_stop_required","error":"Set a TTL of 2 hours or less"}' >&2; exit 1 ;;
+  *" --ttl 7200 "*) echo '{"id":"bx_new"}' ;;
+  *) exit 1 ;;
+esac
+"#;
+
+    fn fake_boat(name: &str, flag: Option<&str>) -> (Boat, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("t3boat-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("boat");
+        std::fs::write(&bin, TRIAL_BOAT).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if let Some(flag) = flag {
+            std::fs::write(dir.join(flag), "").unwrap();
+        }
+        (Boat::at(bin), dir)
+    }
+
+    fn calls(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("log")).unwrap_or_default().lines().map(str::to_owned).collect()
+    }
+
+    #[tokio::test]
+    async fn trial_accounts_get_the_longest_ttl_instead_of_no_auto_stop() {
+        let (boat, dir) = fake_boat("trial", Some("trial"));
+        assert_eq!(boat.create("m", "default", None).await.unwrap(), "bx_new");
+        assert_eq!(boat.resume("bx_new", "small").await.unwrap(), Resume::Resumed);
+        assert_eq!(
+            calls(&dir),
+            [
+                "new --name m --type default --no-auto-stop",
+                "new --name m --type default --ttl 7200",
+                "resume bx_new --type small --no-auto-stop",
+                "resume bx_new --type small --ttl 7200",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn paid_accounts_and_other_failures_never_fall_back_to_a_ttl() {
+        let (paid, dir) = fake_boat("paid", None);
+        assert_eq!(paid.create("m", "large", None).await.unwrap(), "bx_new");
+        assert_eq!(calls(&dir), ["new --name m --type large --no-auto-stop"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (down, dir) = fake_boat("down", Some("down"));
+        let err = down.create("m", "default", None).await.unwrap_err().to_string();
+        assert!(err.contains("Boat is down"), "{err}");
+        assert_eq!(calls(&dir), ["new --name m --type default --no-auto-stop"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
