@@ -1,0 +1,23 @@
+apps/desktop/src-tauri/src/boat.rs
+  s_4f95161adc70bd::t_127082a46518e5 108-116
+  s_4f95161adc70bd::t_d371b9df5b3ddb 172
+  s_4f95161adc70bd::t_2f85b9d92958ed 143,145-149
+  s_4f95161adc70bd::t_9baca7e2be1d8d 10-11
+  s_4f95161adc70bd::t_fccaf84f8095a1 321-386
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2220280910a13e705a4ad4db3d7a494ba67e86bc",
+  "prompts": {},
+  "sessions": {
+    "s_4f95161adc70bd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6bf4ea91-2b82-4158-bace-33005641396a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Taras Shynkarenko <taras.shinkarenko@gmail.com>"
+    }
+  }
+}
