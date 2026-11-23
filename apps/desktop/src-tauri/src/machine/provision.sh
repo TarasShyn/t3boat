@@ -42,6 +42,14 @@ if [ "$(cat /etc/machine-info 2>/dev/null || true)" != "$machine_info" ]; then
   restart_t3=1
 fi
 "$t3" service install --allow-downgrade >/dev/null
+# The server gets Boat's Claude login from the login shell, which reads /run/ascii-secrets/env.sh.
+# Boat writes that file a minute or more after a wake, so the server waits for it.
+mkdir -p "$units/t3code.service.d"
+cat >"$units/t3code.service.d/t3boat-boat-credentials.conf" <<'UNIT'
+[Service]
+TimeoutStartSec=300
+ExecStartPre=/bin/sh -c 'for _ in $$(seq 240); do [ -s /run/ascii-secrets/env.sh ] && exit 0; sleep 1; done'
+UNIT
 systemctl --user daemon-reload
 systemctl --user is-active --quiet t3code.service || restart_t3=1
 [ "$restart_t3" = 0 ] || systemctl --user restart t3code.service
