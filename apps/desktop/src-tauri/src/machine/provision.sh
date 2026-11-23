@@ -42,13 +42,14 @@ if [ "$(cat /etc/machine-info 2>/dev/null || true)" != "$machine_info" ]; then
   restart_t3=1
 fi
 "$t3" service install --allow-downgrade >/dev/null
-# The server gets Boat's Claude login from the login shell, which reads /run/ascii-secrets/env.sh.
-# Boat writes that file a minute or more after a wake, so the server waits for it.
+# Boat's Claude login and GitHub token live in /run/ascii-secrets/env.sh, which only login shells
+# read, and Boat writes it a minute or more after a wake: the server waits for it and loads them.
 mkdir -p "$units/t3code.service.d"
 cat >"$units/t3code.service.d/t3boat-boat-credentials.conf" <<'UNIT'
 [Service]
 TimeoutStartSec=300
-ExecStartPre=/bin/sh -c 'for _ in $$(seq 240); do [ -s /run/ascii-secrets/env.sh ] && exit 0; sleep 1; done'
+EnvironmentFile=-%t/t3boat-boat-credentials.env
+ExecStartPre=/bin/sh -c 'for _ in $$(seq 240); do [ -s /run/ascii-secrets/env.sh ] && break; sleep 1; done; umask 077; sed -n "s/^export \\(CLAUDE_CODE_OAUTH_TOKEN\\|GITHUB_TOKEN\\)=/\\1=/p" /run/ascii-secrets/env.sh >%t/t3boat-boat-credentials.env 2>/dev/null || true'
 UNIT
 systemctl --user daemon-reload
 systemctl --user is-active --quiet t3code.service || restart_t3=1
