@@ -42,16 +42,54 @@ if [ "$(cat /etc/machine-info 2>/dev/null || true)" != "$machine_info" ]; then
   restart_t3=1
 fi
 "$t3" service install --allow-downgrade >/dev/null
-# Boat's Claude login and GitHub token live in /run/ascii-secrets/env.sh, which only login shells
-# read, and Boat writes it a minute or more after a wake: the server waits for it and loads them.
+# Boat writes its Claude and GitHub tokens to /run/ascii-secrets/env.sh after the user services start.
+# Claude Code re-reads its login file but never its environment, so the Claude token goes into the file.
+cat >"$boat_dir/claude-login" <<'SCRIPT'
+#!/bin/sh
+set -eu
+token=$(. /run/ascii-secrets/env.sh >/dev/null 2>&1; printf %s "${CLAUDE_CODE_OAUTH_TOKEN:-}")
+[ -n "$token" ] || exit 0
+TOKEN="$token" exec node -e '
+  const fs = require("fs"), path = require("path"), os = require("os");
+  const file = path.join(os.homedir(), ".claude", ".credentials.json");
+  let current = null;
+  try { current = JSON.parse(fs.readFileSync(file, "utf8")).claudeAiOauth; } catch {}
+  if (current && (current.refreshToken || current.accessToken === process.env.TOKEN)) process.exit(0);
+  const login = { claudeAiOauth: { accessToken: process.env.TOKEN, refreshToken: null, expiresAt: 4102444800000, scopes: ["user:inference"] } };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file + ".tmp", JSON.stringify(login), { mode: 0o600 });
+  fs.renameSync(file + ".tmp", file);
+'
+SCRIPT
+chmod 700 "$boat_dir/claude-login"
+cat >"$units/t3boat-claude-login.service" <<'UNIT'
+[Unit]
+Description=t3boat: write Boat's active Claude account to Claude's login file
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -lc 'exec %h/.t3boat/claude-login'
+UNIT
+cat >"$units/t3boat-claude-login.path" <<'UNIT'
+[Unit]
+Description=t3boat: follow Boat's Claude account switches
+
+[Path]
+PathChanged=/run/ascii-secrets/env.sh
+
+[Install]
+WantedBy=default.target
+UNIT
 mkdir -p "$units/t3code.service.d"
 cat >"$units/t3code.service.d/t3boat-boat-credentials.conf" <<'UNIT'
 [Service]
 TimeoutStartSec=300
 EnvironmentFile=-%t/t3boat-boat-credentials.env
-ExecStartPre=/bin/sh -c 'for _ in $$(seq 240); do [ -s /run/ascii-secrets/env.sh ] && break; sleep 1; done; umask 077; sed -n "s/^export \\(CLAUDE_CODE_OAUTH_TOKEN\\|GITHUB_TOKEN\\)=/\\1=/p" /run/ascii-secrets/env.sh >%t/t3boat-boat-credentials.env 2>/dev/null || true'
+ExecStartPre=/bin/sh -c 'for _ in $$(seq 240); do [ -s /run/ascii-secrets/env.sh ] && break; sleep 1; done; umask 077; sed -n "s/^export \\(GITHUB_TOKEN\\)=/\\1=/p" /run/ascii-secrets/env.sh >%t/t3boat-boat-credentials.env 2>/dev/null || true'
+ExecStartPre=-/bin/bash -lc 'exec %h/.t3boat/claude-login'
 UNIT
 systemctl --user daemon-reload
+systemctl --user enable --now t3boat-claude-login.path >/dev/null 2>&1
 systemctl --user is-active --quiet t3code.service || restart_t3=1
 [ "$restart_t3" = 0 ] || systemctl --user restart t3code.service
 
