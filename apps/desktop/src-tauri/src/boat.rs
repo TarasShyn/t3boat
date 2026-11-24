@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use crate::process::command;
 
-const TRIAL_MAX_TTL_SECS: &str = "7200";
+/// Boat's longest lifetime on a free trial, which refuses `--no-auto-stop`.
+const TRIAL_TTL_SECS: u64 = 7200;
 
 #[derive(Clone, Debug)]
 pub struct Boat {
@@ -20,6 +21,17 @@ pub struct Sandbox {
     pub id: String,
     pub state: String,
     pub stopped_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When Boat stops it on its own; none without a lifetime or while stopped.
+    pub archive_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub ttl_seconds: Option<u64>,
+}
+
+impl Sandbox {
+    /// When Boat stops it on its own, for a trial lifetime this app set. One the user set
+    /// themselves is theirs to keep.
+    pub fn trial_deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.archive_after.filter(|_| self.ttl_seconds == Some(TRIAL_TTL_SECS))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -111,7 +123,8 @@ impl Boat {
         if ok || !said(&stdout, &stderr).contains("trial_auto_stop_required") {
             return Ok((ok, stdout, stderr));
         }
-        self.output(&[args, &["--ttl", TRIAL_MAX_TTL_SECS]].concat(), timeout).await
+        let ttl = TRIAL_TTL_SECS.to_string();
+        self.output(&[args, &["--ttl", &ttl]].concat(), timeout).await
     }
 
     async fn run(&self, args: &[&str], timeout: Duration) -> Result<String> {
@@ -202,6 +215,13 @@ impl Boat {
     /// Stops and snapshots it for resume; returns once Boat took the stop.
     pub async fn stop(&self, id: &str) -> Result<()> {
         self.run(&["stop", id], Duration::from_secs(60)).await.map(drop)
+    }
+
+    /// Resets a trial sandbox's lifetime to the longest. Only from here: the sandbox's own key
+    /// can't extend it.
+    pub async fn extend_trial(&self, id: &str) -> Result<()> {
+        let ttl = TRIAL_TTL_SECS.to_string();
+        self.run(&["extend", id, "--ttl", &ttl], Duration::from_secs(20)).await.map(drop)
     }
 
     pub async fn delete(&self, id: &str) -> Result<()> {
@@ -326,7 +346,7 @@ pub(crate) fn path_str(path: &Path) -> Result<&str> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{Boat, Resume};
+    use super::{Boat, Resume, Sandbox};
     use std::os::unix::fs::PermissionsExt;
 
     const TRIAL_BOAT: &str = r#"#!/bin/sh
@@ -387,5 +407,20 @@ esac
         assert!(err.contains("Boat is down"), "{err}");
         assert_eq!(calls(&dir), ["new --name m --type default --no-auto-stop"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_trial_lifetime_this_app_sets_is_renewed() {
+        let ends = "2026-11-24T12:00:00Z".parse().unwrap();
+        let sandbox = |ttl_seconds| Sandbox {
+            id: "bx_1".into(),
+            state: "running".into(),
+            stopped_at: None,
+            archive_after: Some(ends),
+            ttl_seconds,
+        };
+        assert_eq!(sandbox(Some(7200)).trial_deadline(), Some(ends));
+        assert_eq!(sandbox(None).trial_deadline(), None);
+        assert_eq!(sandbox(Some(3600)).trial_deadline(), None);
     }
 }
