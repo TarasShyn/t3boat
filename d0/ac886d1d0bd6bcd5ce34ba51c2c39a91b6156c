@@ -1,0 +1,19 @@
+apps/desktop/src-tauri/src/machine/watchdog.mjs
+  s_4f95161adc70bd::t_8402acf5fd6415 56-64,86,239-240,364-372,493,537
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d0ac886d1d0bd6bcd5ce34ba51c2c39a91b6156c",
+  "prompts": {},
+  "sessions": {
+    "s_4f95161adc70bd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6bf4ea91-2b82-4158-bace-33005641396a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Taras Shynkarenko <taras.shinkarenko@gmail.com>"
+    }
+  }
+}
