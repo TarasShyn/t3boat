@@ -88,8 +88,114 @@ EnvironmentFile=-%t/t3boat-boat-credentials.env
 ExecStartPre=/bin/sh -c 'for _ in $$(seq 240); do [ -s /run/ascii-secrets/env.sh ] && break; sleep 1; done; umask 077; sed -n "s/^export \\(GITHUB_TOKEN\\)=/\\1=/p" /run/ascii-secrets/env.sh >%t/t3boat-boat-credentials.env 2>/dev/null || true'
 ExecStartPre=-/bin/bash -lc 'exec %h/.t3boat/claude-login'
 UNIT
+# Boat renews a login by issuing a new token, and the old one stops working before every machine
+# has the new one. A turn that dies in that gap is continued once the login works again.
+cat >"$boat_dir/claude-auth-recover.mjs" <<'SCRIPT'
+import { DatabaseSync } from "node:sqlite";
+import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+const run = promisify(execFile);
+const HOME = homedir();
+const DB_PATH = join(HOME, ".t3", "userdata", "statev2.sqlite");
+const CREDENTIALS = join(HOME, ".claude", ".credentials.json");
+const T3 = join(HOME, ".local", "bin", "t3");
+const TICK_MS = 20_000;
+const WINDOW_MS = 60 * 60_000;
+const MAX_CONTINUES_PER_WINDOW = 3;
+const AUTH_FAILURE = /^(Failed to authenticate|Not logged in)|OAuth token (revoked|has expired)/;
+const CONTINUE =
+  "Your last turn stopped because Claude's login had expired. The login works again, so carry on where you stopped.";
+
+const log = (...args) => console.log(new Date().toISOString(), ...args);
+/** threadId -> times this watcher continued it, within the window. */
+const continued = new Map();
+
+/** Threads whose latest turn ended on a failed Claude login, with nothing sent to them since. */
+function stalledThreads() {
+  const since = new Date(Date.now() - WINDOW_MS).toISOString();
+  const db = new DatabaseSync(DB_PATH, { readOnly: true });
+  try {
+    const rows = db
+      .prepare(
+        `SELECT item.thread_id AS threadId, json_extract(item.payload_json, '$.text') AS text
+         FROM orchestration_v2_projection_turn_items AS item
+         WHERE item.thread_id IN (SELECT thread_id FROM orchestration_v2_projection_threads WHERE updated_at > ?)
+           AND item.type = 'assistant_message' AND item.updated_at > ?
+           AND NOT EXISTS (
+             SELECT 1 FROM orchestration_v2_projection_messages AS message
+             WHERE message.thread_id = item.thread_id AND message.role = 'user'
+               AND message.created_at > item.updated_at
+           )`,
+      )
+      .all(since, since);
+    return [...new Set(rows.filter((r) => AUTH_FAILURE.test(r.text ?? "")).map((r) => r.threadId))];
+  } finally {
+    db.close();
+  }
+}
+
+async function loginWorks() {
+  await run("bash", ["-lc", 'exec "$HOME/.t3boat/claude-login"']).catch(() => {});
+  let token;
+  try {
+    token = JSON.parse(readFileSync(CREDENTIALS, "utf8")).claudeAiOauth?.accessToken;
+  } catch {
+    return false;
+  }
+  if (!token) return false;
+  const res = await fetch("https://api.anthropic.com/api/oauth/profile", {
+    headers: { authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" },
+    signal: AbortSignal.timeout(10_000),
+  }).catch(() => null);
+  return res?.ok === true;
+}
+
+async function tick() {
+  const now = Date.now();
+  for (const [threadId, times] of continued) {
+    const recent = times.filter((t) => now - t < WINDOW_MS);
+    recent.length > 0 ? continued.set(threadId, recent) : continued.delete(threadId);
+  }
+  const stalled = stalledThreads().filter((id) => (continued.get(id)?.length ?? 0) < MAX_CONTINUES_PER_WINDOW);
+  if (stalled.length === 0 || !(await loginWorks())) return;
+  for (const threadId of stalled) {
+    await run(T3, ["thread", "send", threadId, CONTINUE]);
+    continued.set(threadId, [...(continued.get(threadId) ?? []), now]);
+    log("continued", threadId);
+  }
+}
+
+log("watching for turns that died on an expired Claude login");
+async function loop() {
+  await tick().catch((e) => log("tick failed", e.message));
+  setTimeout(loop, TICK_MS);
+}
+loop();
+SCRIPT
+chmod 600 "$boat_dir/claude-auth-recover.mjs"
+cat >"$units/t3boat-claude-auth-recover.service" <<'UNIT'
+[Unit]
+Description=t3boat: continue threads whose turn died on an expired Claude login
+After=t3code.service
+
+[Service]
+ExecStart=/bin/bash -lc 'exec node --no-warnings %h/.t3boat/claude-auth-recover.mjs'
+Restart=always
+RestartSec=10
+StandardOutput=append:%h/.t3boat/claude-auth-recover.log
+StandardError=append:%h/.t3boat/claude-auth-recover.log
+
+[Install]
+WantedBy=default.target
+UNIT
 systemctl --user daemon-reload
 systemctl --user enable --now t3boat-claude-login.path >/dev/null 2>&1
+systemctl --user enable t3boat-claude-auth-recover.service >/dev/null 2>&1
+systemctl --user restart t3boat-claude-auth-recover.service
 systemctl --user is-active --quiet t3code.service || restart_t3=1
 [ "$restart_t3" = 0 ] || systemctl --user restart t3code.service
 
