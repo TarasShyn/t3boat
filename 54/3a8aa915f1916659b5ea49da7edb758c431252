@@ -1,0 +1,19 @@
+apps/desktop/src-tauri/src/machine/provision.sh
+  s_4f95161adc70bd::t_febc892d8b1173 45-47,51-71,76,84,102,116,119-120,126-130,136-141,144,149-150,153-159,165-166,172,174,179,188-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "543a8aa915f1916659b5ea49da7edb758c431252",
+  "prompts": {},
+  "sessions": {
+    "s_4f95161adc70bd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6bf4ea91-2b82-4158-bace-33005641396a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Taras Shynkarenko <taras.shinkarenko@gmail.com>"
+    }
+  }
+}
