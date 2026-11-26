@@ -42,29 +42,38 @@ if [ "$(cat /etc/machine-info 2>/dev/null || true)" != "$machine_info" ]; then
   restart_t3=1
 fi
 "$t3" service install --allow-downgrade >/dev/null
-# Boat writes its Claude and GitHub tokens to /run/ascii-secrets/env.sh after the user services start.
-# Claude Code re-reads its login file but never its environment, so the Claude token goes into the file.
+# Boat writes its Claude and GitHub tokens to /run/ascii-secrets/env.sh after the user services start,
+# minutes after a cold boot, and rewrites it on every renewal or account switch. Both tokens go where
+# their tools re-read them on every use, so T3 starts at once and never holds a stale copy.
 cat >"$boat_dir/claude-login" <<'SCRIPT'
 #!/bin/sh
 set -eu
-token=$(. /run/ascii-secrets/env.sh >/dev/null 2>&1; printf %s "${CLAUDE_CODE_OAUTH_TOKEN:-}")
-[ -n "$token" ] || exit 0
-TOKEN="$token" exec node -e '
-  const fs = require("fs"), path = require("path"), os = require("os");
-  const file = path.join(os.homedir(), ".claude", ".credentials.json");
-  let current = null;
-  try { current = JSON.parse(fs.readFileSync(file, "utf8")).claudeAiOauth; } catch {}
-  if (current && (current.refreshToken || current.accessToken === process.env.TOKEN)) process.exit(0);
-  const login = { claudeAiOauth: { accessToken: process.env.TOKEN, refreshToken: null, expiresAt: 4102444800000, scopes: ["user:inference"] } };
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file + ".tmp", JSON.stringify(login), { mode: 0o600 });
-  fs.renameSync(file + ".tmp", file);
-'
+secrets=/run/ascii-secrets/env.sh
+claude_token=$(. "$secrets" >/dev/null 2>&1; printf %s "${CLAUDE_CODE_OAUTH_TOKEN:-}")
+github_token=$(. "$secrets" >/dev/null 2>&1; printf %s "${GITHUB_TOKEN:-}")
+if [ -n "$claude_token" ]; then
+  TOKEN="$claude_token" node -e '
+    const fs = require("fs"), path = require("path"), os = require("os");
+    const file = path.join(os.homedir(), ".claude", ".credentials.json");
+    let current = null;
+    try { current = JSON.parse(fs.readFileSync(file, "utf8")).claudeAiOauth; } catch {}
+    if (current && (current.refreshToken || current.accessToken === process.env.TOKEN)) process.exit(0);
+    const login = { claudeAiOauth: { accessToken: process.env.TOKEN, refreshToken: null, expiresAt: 4102444800000, scopes: ["user:inference"] } };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file + ".tmp", JSON.stringify(login), { mode: 0o600 });
+    fs.renameSync(file + ".tmp", file);
+  '
+fi
+if [ -n "$github_token" ] && command -v gh >/dev/null; then
+  stored=$(env -u GITHUB_TOKEN -u GH_TOKEN gh auth token --hostname github.com 2>/dev/null || true)
+  [ "$stored" = "$github_token" ] ||
+    printf %s "$github_token" | env -u GITHUB_TOKEN -u GH_TOKEN gh auth login --hostname github.com --git-protocol https --insecure-storage --with-token
+fi
 SCRIPT
 chmod 700 "$boat_dir/claude-login"
 cat >"$units/t3boat-claude-login.service" <<'UNIT'
 [Unit]
-Description=t3boat: write Boat's active Claude account to Claude's login file
+Description=t3boat: hand Boat's Claude and GitHub logins to Claude and gh
 
 [Service]
 Type=oneshot
@@ -72,7 +81,7 @@ ExecStart=/bin/bash -lc 'exec %h/.t3boat/claude-login'
 UNIT
 cat >"$units/t3boat-claude-login.path" <<'UNIT'
 [Unit]
-Description=t3boat: follow Boat's Claude account switches
+Description=t3boat: follow Boat's login renewals and account switches
 
 [Path]
 PathChanged=/run/ascii-secrets/env.sh
@@ -83,9 +92,6 @@ UNIT
 mkdir -p "$units/t3code.service.d"
 cat >"$units/t3code.service.d/t3boat-boat-credentials.conf" <<'UNIT'
 [Service]
-TimeoutStartSec=300
-EnvironmentFile=-%t/t3boat-boat-credentials.env
-ExecStartPre=/bin/sh -c 'for _ in $$(seq 240); do [ -s /run/ascii-secrets/env.sh ] && break; sleep 1; done; umask 077; sed -n "s/^export \\(GITHUB_TOKEN\\)=/\\1=/p" /run/ascii-secrets/env.sh >%t/t3boat-boat-credentials.env 2>/dev/null || true'
 ExecStartPre=-/bin/bash -lc 'exec %h/.t3boat/claude-login'
 UNIT
 # Boat renews a login by issuing a new token, and the old one stops working before every machine
@@ -93,7 +99,7 @@ UNIT
 cat >"$boat_dir/claude-auth-recover.mjs" <<'SCRIPT'
 import { DatabaseSync } from "node:sqlite";
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -107,51 +113,70 @@ const TICK_MS = 20_000;
 const WINDOW_MS = 60 * 60_000;
 const MAX_CONTINUES_PER_WINDOW = 3;
 const AUTH_FAILURE = /^(Failed to authenticate|Not logged in)|OAuth token (revoked|has expired)/;
+const START_FAILURE = "The provider could not start this turn";
 const CONTINUE =
   "Your last turn stopped because Claude's login had expired. The login works again, so carry on where you stopped.";
+const resend = (text) =>
+  `My last message never reached you, because Claude's login was being renewed when I sent it. It was:\n\n${text}`;
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 /** threadId -> times this watcher continued it, within the window. */
 const continued = new Map();
 
-/** Threads whose latest turn ended on a failed Claude login, with nothing sent to them since. */
-function stalledThreads() {
+/**
+ * Each thread's latest turn, when it ended on a failed Claude login (mid-turn) or failed to start
+ * (the login check before a session can begin), with nothing sent to the thread since.
+ */
+function stalledTurns() {
   const since = new Date(Date.now() - WINDOW_MS).toISOString();
   const db = new DatabaseSync(DB_PATH, { readOnly: true });
   try {
     const rows = db
       .prepare(
-        `SELECT item.thread_id AS threadId, json_extract(item.payload_json, '$.text') AS text
+        `SELECT item.thread_id AS threadId, item.type AS type, item.updated_at AS at,
+           json_extract(item.payload_json, '$.text') AS text,
+           json_extract(item.payload_json, '$.failure.message') AS failure,
+           (SELECT json_extract(sent.payload_json, '$.text') FROM orchestration_v2_projection_turn_items AS sent
+            WHERE sent.run_id = item.run_id AND sent.type = 'user_message'
+            ORDER BY sent.ordinal DESC LIMIT 1) AS userText
          FROM orchestration_v2_projection_turn_items AS item
          WHERE item.thread_id IN (SELECT thread_id FROM orchestration_v2_projection_threads WHERE updated_at > ?)
-           AND item.type = 'assistant_message' AND item.updated_at > ?
+           AND item.type IN ('assistant_message', 'error') AND item.updated_at > ?
            AND NOT EXISTS (
              SELECT 1 FROM orchestration_v2_projection_messages AS message
              WHERE message.thread_id = item.thread_id AND message.role = 'user'
                AND message.created_at > item.updated_at
-           )`,
+           )
+         ORDER BY item.updated_at`,
       )
       .all(since, since);
-    return [...new Set(rows.filter((r) => AUTH_FAILURE.test(r.text ?? "")).map((r) => r.threadId))];
+    const latest = new Map();
+    for (const row of rows) {
+      if (row.type === "assistant_message" && AUTH_FAILURE.test(row.text ?? "")) latest.set(row.threadId, row);
+      else if (row.type === "error" && (row.failure ?? "").startsWith(START_FAILURE) && row.userText)
+        latest.set(row.threadId, row);
+    }
+    return [...latest.values()];
   } finally {
     db.close();
   }
 }
 
-async function loginWorks() {
+/** Copies Boat's current token into the login file; returns when the file last changed, or null when the login fails. */
+async function workingLoginSince() {
   await run("bash", ["-lc", 'exec "$HOME/.t3boat/claude-login"']).catch(() => {});
   let token;
   try {
     token = JSON.parse(readFileSync(CREDENTIALS, "utf8")).claudeAiOauth?.accessToken;
   } catch {
-    return false;
+    return null;
   }
-  if (!token) return false;
+  if (!token) return null;
   const res = await fetch("https://api.anthropic.com/api/oauth/profile", {
     headers: { authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" },
     signal: AbortSignal.timeout(10_000),
   }).catch(() => null);
-  return res?.ok === true;
+  return res?.ok === true ? statSync(CREDENTIALS).mtimeMs : null;
 }
 
 async function tick() {
@@ -160,12 +185,16 @@ async function tick() {
     const recent = times.filter((t) => now - t < WINDOW_MS);
     recent.length > 0 ? continued.set(threadId, recent) : continued.delete(threadId);
   }
-  const stalled = stalledThreads().filter((id) => (continued.get(id)?.length ?? 0) < MAX_CONTINUES_PER_WINDOW);
-  if (stalled.length === 0 || !(await loginWorks())) return;
-  for (const threadId of stalled) {
-    await run(T3, ["thread", "send", threadId, CONTINUE]);
-    continued.set(threadId, [...(continued.get(threadId) ?? []), now]);
-    log("continued", threadId);
+  const stalled = stalledTurns().filter((t) => (continued.get(t.threadId)?.length ?? 0) < MAX_CONTINUES_PER_WINDOW);
+  if (stalled.length === 0) return;
+  const loginSince = await workingLoginSince();
+  if (loginSince === null) return;
+  for (const turn of stalled) {
+    // A start can fail for other reasons; only a new login since then says it was this one.
+    if (turn.type === "error" && loginSince <= Date.parse(turn.at)) continue;
+    await run(T3, ["thread", "send", turn.threadId, turn.type === "error" ? resend(turn.userText) : CONTINUE]);
+    continued.set(turn.threadId, [...(continued.get(turn.threadId) ?? []), now]);
+    log(turn.type === "error" ? "resent" : "continued", turn.threadId);
   }
 }
 
